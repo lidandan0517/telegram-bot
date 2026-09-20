@@ -33,24 +33,48 @@ const threadHealthCache = new Map();
 const topicCreateInFlight = new Map();
 const adminStatusCache = new Map();
 
-// --- 本地题库 (15条) ---
-const LOCAL_QUESTIONS = [
-    {"question": "冰融化后会变成什么？", "correct_answer": "水", "incorrect_answers": ["石头", "木头", "火"]},
-    {"question": "正常人有几只眼睛？", "correct_answer": "2", "incorrect_answers": ["1", "3", "4"]},
-    {"question": "以下哪个属于水果？", "correct_answer": "香蕉", "incorrect_answers": ["白菜", "猪肉", "大米"]},
-    {"question": "1 加 2 等于几？", "correct_answer": "3", "incorrect_answers": ["2", "4", "5"]},
-    {"question": "5 减 2 等于几？", "correct_answer": "3", "incorrect_answers": ["1", "2", "4"]},
-    {"question": "2 乘以 3 等于几？", "correct_answer": "6", "incorrect_answers": ["4", "5", "7"]},
-    {"question": "10 加 5 等于几？", "correct_answer": "15", "incorrect_answers": ["10", "12", "20"]},
-    {"question": "8 减 4 等于几？", "correct_answer": "4", "incorrect_answers": ["2", "3", "5"]},
-    {"question": "在天上飞的交通工具是什么？", "correct_answer": "飞机", "incorrect_answers": ["汽车", "轮船", "自行车"]},
-    {"question": "星期一的后面是星期几？", "correct_answer": "星期二", "incorrect_answers": ["星期日", "星期五", "星期三"]},
-    {"question": "鱼通常生活在哪里？", "correct_answer": "水里", "incorrect_answers": ["树上", "土里", "火里"]},
-    {"question": "我们用什么器官来听声音？", "correct_answer": "耳朵", "incorrect_answers": ["眼睛", "鼻子", "嘴巴"]},
-    {"question": "晴朗的天空通常是什么颜色的？", "correct_answer": "蓝色", "incorrect_answers": ["绿色", "红色", "紫色"]},
-    {"question": "太阳从哪个方向升起？", "correct_answer": "东方", "incorrect_answers": ["西方", "南方", "北方"]},
-    {"question": "小狗发出的叫声通常是？", "correct_answer": "汪汪", "incorrect_answers": ["喵喵", "咩咩", "呱呱"]}
-];
+// --- 动态生成 20 以内加减乘算术题 ---
+function generateDynamicQuestion() {
+    const types = ['+', '-', '×'];
+    const op = types[secureRandomInt(0, types.length)];
+    let a, b, answer, questionText;
+
+    if (op === '+') {
+        a = secureRandomInt(2, 20);
+        b = secureRandomInt(2, 20);
+        answer = a + b;
+        questionText = `${a} + ${b} = ?`;
+    } else if (op === '-') {
+        const temp1 = secureRandomInt(5, 30);
+        const temp2 = secureRandomInt(2, 20);
+        a = Math.max(temp1, temp2);
+        b = Math.min(temp1, temp2);
+        answer = a - b;
+        questionText = `${a} - ${b} = ?`;
+    } else {
+        a = secureRandomInt(2, 9);
+        b = secureRandomInt(2, 9);
+        answer = a * b;
+        questionText = `${a} × ${b} = ?`;
+    }
+
+    const correctAnswer = String(answer);
+    const incorrectAnswers = new Set();
+
+    while (incorrectAnswers.size < 3) {
+        const offset = secureRandomInt(1, 6) * (Math.random() > 0.5 ? 1 : -1);
+        const fake = String(Math.max(1, answer + offset));
+        if (fake !== correctAnswer) {
+            incorrectAnswers.add(fake);
+        }
+    }
+
+    return {
+        question: `请回答：${questionText}`,
+        correct_answer: correctAnswer,
+        incorrect_answers: Array.from(incorrectAnswers)
+    };
+}
 
 // --- 辅助工具函数 ---
 
@@ -134,25 +158,32 @@ function isTestMessageInvalid(description) {
 }
 
 async function getOrCreateUserTopicRec(from, key, env, userId) {
+    // 1. 先检查是否已有话题
     const existing = await safeGetJSON(env, key, null);
     if (existing && existing.thread_id) return existing;
 
-    const inflight = topicCreateInFlight.get(String(userId));
-    if (inflight) return await inflight;
+    const lockKey = `lock:create_topic:${userId}`;
 
-    const p = (async () => {
-        const again = await safeGetJSON(env, key, null);
-        if (again && again.thread_id) return again;
-        return await createTopic(from, key, env, userId);
-    })();
+    // 2. 检查分布式互斥锁
+    const isLocked = await env.TOPIC_MAP.get(lockKey);
+    if (isLocked) {
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        const retryRecord = await safeGetJSON(env, key, null);
+        if (retryRecord && retryRecord.thread_id) return retryRecord;
+    }
 
-    topicCreateInFlight.set(String(userId), p);
+    // 3. 上锁（10秒自动过期）
+    await env.TOPIC_MAP.put(lockKey, "1", { expirationTtl: 10 });
+
     try {
-        return await p;
+        const doubleCheck = await safeGetJSON(env, key, null);
+        if (doubleCheck && doubleCheck.thread_id) return doubleCheck;
+
+        const newRecord = await createTopic(from, key, env, userId);
+        return newRecord;
     } finally {
-        if (topicCreateInFlight.get(String(userId)) === p) {
-            topicCreateInFlight.delete(String(userId));
-        }
+        // 4. 释放锁
+        await env.TOPIC_MAP.delete(lockKey);
     }
 }
 
@@ -322,7 +353,14 @@ export default {
     if (!env.TOPIC_MAP) return new Response("Error: KV 'TOPIC_MAP' not bound.");
     if (!env.BOT_TOKEN) return new Response("Error: BOT_TOKEN not set.");
     if (!env.SUPERGROUP_ID) return new Response("Error: SUPERGROUP_ID not set.");
-
+// [新增] 校验 Telegram Webhook 密钥，防止恶意请求
+    if (env.SECRET_TOKEN) {
+        const secretHeader = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+        if (secretHeader !== env.SECRET_TOKEN) {
+            Logger.warn('unauthorized_webhook_request', { ip: request.headers.get("cf-connecting-ip") });
+            return new Response("Unauthorized", { status: 403 });
+        }
+    }
     const normalizedEnv = {
         ...env,
         SUPERGROUP_ID: String(env.SUPERGROUP_ID),
@@ -751,7 +789,7 @@ async function sendVerificationChallenge(userId, env, pendingMsgId) {
         return;
     }
 
-    const q = LOCAL_QUESTIONS[secureRandomInt(0, LOCAL_QUESTIONS.length)];
+    const q = generateDynamicQuestion();
     const challenge = {
         question: q.question,
         correct: q.correct_answer,
