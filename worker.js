@@ -21,7 +21,8 @@ const CONFIG = {
     MAX_TITLE_LENGTH: 128,
     MAX_NAME_LENGTH: 30,
     API_TIMEOUT_MS: 10000,
-    CLEANUP_BATCH_SIZE: 10,
+    CLEANUP_BATCH_SIZE: 5,    // 缩小单批并发数
+    MAX_CLEANUP_PER_RUN: 15,   // 每次运行最多检查 15 人，确保总子请求不超过 40 次（兼容 Free 计划限制）
     MAX_CLEANUP_DISPLAY: 20,
     CLEANUP_LOCK_TTL_SECONDS: 1800,     // /cleanup 防并发锁 30 分钟
     MAX_RETRY_ATTEMPTS: 3,
@@ -77,7 +78,11 @@ function generateDynamicQuestion() {
 }
 
 // --- 辅助工具函数 ---
-
+// Markdown 特殊字符转义
+function escapeMarkdown(text) {
+    if (!text) return "";
+    return String(text).replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+}
 // 结构化日志系统
 const Logger = {
     info(action, data = {}) {
@@ -336,7 +341,7 @@ function shuffleArray(arr) {
 }
 
 async function checkRateLimit(userId, env, action = 'message', limit = 20, window = 60) {
-    const key = `ratelimit:\( {action}: \){userId}`;
+    const key = `ratelimit:${action}:${userId}`;
     const countStr = await env.TOPIC_MAP.get(key);
     const count = parseInt(countStr || "0");
 
@@ -354,13 +359,11 @@ export default {
     if (!env.BOT_TOKEN) return new Response("Error: BOT_TOKEN not set.");
     if (!env.SUPERGROUP_ID) return new Response("Error: SUPERGROUP_ID not set.");
 // [新增] 校验 Telegram Webhook 密钥，防止恶意请求
-    if (env.SECRET_TOKEN) {
-        const secretHeader = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
-        if (secretHeader !== env.SECRET_TOKEN) {
-            Logger.warn('unauthorized_webhook_request', { ip: request.headers.get("cf-connecting-ip") });
-            return new Response("Unauthorized", { status: 403 });
-        }
-    }
+    const secretHeader = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+if (!env.SECRET_TOKEN || secretHeader !== env.SECRET_TOKEN) {
+    Logger.warn('unauthorized_webhook_request', { ip: request.headers.get("cf-connecting-ip") });
+    return new Response("Unauthorized", { status: 403 });
+}
     const normalizedEnv = {
         ...env,
         SUPERGROUP_ID: String(env.SUPERGROUP_ID),
@@ -740,9 +743,15 @@ async function handleAdminReply(msg, env, ctx) {
       const verifyStatus = await env.TOPIC_MAP.get(`verified:${userId}`);
       const banStatus = await env.TOPIC_MAP.get(`banned:${userId}`);
 
-      const info = `👤 **用户信息**\nUID: \`\( {userId}\`\nTopic ID: \` \){threadId}\`\n话题标题: ${userRec?.title || "未知"}\n验证状态: ${verifyStatus ? (verifyStatus === 'trusted' ? '🌟 永久信任' : '✅ 已验证') : '❌ 未验证'}\n封禁状态: \( {banStatus ? '🚫 已封禁' : '✅ 正常'}\nLink: [点击私聊](tg://user?id= \){userId})`;
-      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: info, parse_mode: "Markdown" });
-      return;
+const safeTitle = escapeMarkdown(userRec?.title || "未知");
+        const isTrusted = verifyStatus === 'trusted' ? '🌟 永久信任' : '✅ 已验证';
+        const vText = verifyStatus ? isTrusted : '❌ 未验证';
+        const bText = banStatus ? '🚫 已封禁' : '✅ 正常';
+
+        const info = `👤 *用户信息*\nUID: \`${userId}\`\nTopic ID: \`${threadId}\`\n话题标题: ${safeTitle}\n验证状态: ${vText}\n封禁状态: ${bText}\nLink: [点击私聊](tg://user?id=${userId})`;
+
+        await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: info, parse_mode: "Markdown" });
+        return;
   }
 
   if (msg.media_group_id) {
@@ -818,7 +827,7 @@ async function sendVerificationChallenge(userId, env, pendingMsgId) {
 
     const buttons = challenge.options.map((opt, idx) => ({
         text: opt,
-        callback_data: `verify:\( {verifyId}: \){idx}`
+        callback_data: `verify:${verifyId}:${idx}`
     }));
 
     const keyboard = [];
@@ -921,7 +930,7 @@ async function handleCallbackQuery(query, env, ctx) {
                     let forwardedCount = 0;
                     for (const pendingId of pendingIds) {
                         if (!pendingId) continue;
-                        const forwardedKey = `forwarded:\( {userId}: \){pendingId}`;
+                        const forwardedKey = `forwarded:${userId}:${pendingId}`;
                         const alreadyForwarded = await env.TOPIC_MAP.get(forwardedKey);
                         if (alreadyForwarded) continue;
 
@@ -1006,9 +1015,12 @@ async function handleCleanupCommand(threadId, env) {
 
     try {
         let cursor = undefined;
-        do {
+do {
             const result = await env.TOPIC_MAP.list({ prefix: "user:", cursor });
-            const names = (result.keys || []).map(k => k.name);
+            const allNames = (result.keys || []).map(k => k.name);
+
+            // 安全截断：最多只取配置的数量
+            const names = allNames.slice(0, CONFIG.MAX_CLEANUP_PER_RUN);
             scannedCount += names.length;
 
             for (let i = 0; i < names.length; i += CONFIG.CLEANUP_BATCH_SIZE) {
@@ -1023,7 +1035,6 @@ async function handleCleanupCommand(threadId, env) {
                         const topicThreadId = rec.thread_id;
 
                         const probe = await probeForumThread(env, topicThreadId, {
-                            userId,
                             reason: "cleanup_check",
                             doubleCheckOnMissingThreadId: false
                         });
@@ -1191,7 +1202,7 @@ async function tgCall(env, method, body, timeout = CONFIG.API_TIMEOUT_MS) {
   const timeoutId = setTimeout(() => controller.abort(), timeout);
 
   try {
-      const resp = await fetch(`\( {base}/bot \){env.BOT_TOKEN}/${method}`, {
+      const resp = await fetch(`${base}/bot${env.BOT_TOKEN}/${method}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
@@ -1225,7 +1236,7 @@ async function tgCall(env, method, body, timeout = CONFIG.API_TIMEOUT_MS) {
 
 async function handleMediaGroup(msg, env, ctx, { direction, targetChat, threadId }) {
     const groupId = msg.media_group_id;
-    const key = `mg:\( {direction}: \){groupId}`;
+    const key = `mg:${direction}:${groupId}`;
     const item = extractMedia(msg);
     if (!item) {
         await tgCall(env, "copyMessage", withMessageThreadId({
